@@ -366,4 +366,22 @@ ahora queda bloqueante, esperando que el server le envie 4 bytes
 
 ![](docs/img/21.png)
 
+luego viene este bucle:
+
+![](docs/img/22.png)
+
+si el fork retorna error, se toma la flecha verde y se va con un exit
+
+si retorna cero, significa que es el proceso duplicado, el hijo y esta parado en la misma zona pasando el CALL
+
+![](docs/img/23.png)
+
+cierra el canal donde writeaba y leia, restaura los registros, storea la posicion hitteada y sale
+
+![](docs/img/24.png)
+
+si es el padre, retorna el PID del proceso el fork entonces se va para aca
+
+![](docs/img/25.png)
+
 
