@@ -384,4 +384,223 @@ si es el padre, retorna el PID del proceso el fork entonces se va para aca
 
 ![](docs/img/25.png)
 
+la parte que justo se corto es la porcion de codigo que envia el PID del hijo por el canal de comunicacion:
 
+![](docs/img/26.png)
+
+y se queda esperando hasta que termine el proceso con el waitpid, como el segundo argumento de waitpid no es NULL, entonces storeara un entero que avisa como fue que murio el proceso:
+
+```c
+#include <sys/types.h>
+#include <sys/wait.h>
+
+pid_t waitpid(pid_t pid, int *wstatus, int options);
+```
+
+y por ultimo envia wstatus por el canal de comunicacion
+
+con esto puede saber si el proceso faulteo o salio aireoso
+
+## como registro el handler 199 y 198?
+
+una de las preguntas que me genera ese codigo, es como logro tener el 199 y 198 para el, veamos el codigo de afl para sacarnos esa duda
+
+crea un pipe y despues duplica el descriptor que se le otorgo, asignandole el 199 y 198:
+
+afl-fuzz.c
+```c
+if (pipe(st_pipe) || pipe(ctl_pipe)) PFATAL("pipe() failed");
+```
+
+y mas abajo:
+
+afl-fuzz.c
+```c
+    if (dup2(ctl_pipe[0], FORKSRV_FD) < 0) PFATAL("dup2() failed");
+    if (dup2(st_pipe[1], FORKSRV_FD + 1) < 0) PFATAL("dup2() failed");
+
+    close(ctl_pipe[0]);
+    close(ctl_pipe[1]);
+    close(st_pipe[0]);
+    close(st_pipe[1]);
+```
+
+## que hizo el cristiano este para coverage de kernel?
+
+la pregunta que todos nos hacemos, como logro que este modo que solo funciona para coverage en procesos de user space, lograr usarlo satisfactoriamente para kernel space
+
+### levantando el kernel con virtme
+
+luego de compilar un kernel, lo podemos levantar con virtme para correrlo virtualmente, esto nos trae la ventaja de que si crashea no vamos a perder nada, porque estamos en el virtual
+
+```console
+sudo ./virtme-run --rw --pwd --kimg ../linux/arch/x86/boot/bzImage --memory 512M
+```
+
+le decimos eso y automagicamente levanta el kernel, nos da una shell de root y nos monta el disco dejandonos acceder a nuestro sistema real
+
+![](docs/img/28.png)
+
+dentro del kernel virtual, corremos
+
+```console
+# ./fuzznetlink --dump --verbose
+```
+
+![](docs/img/29.png)
+
+al toque nos da todos los bloques de memoria que se ejecutaron
+
+### como hizo eso?
+
+primero habilito KCOV al momento de compilar el kernel en las zonas que me interesaban, en el tutorial el flaco se quiere centrar en sockets netlink, asi que habilito kernel coverage solo en la carpeta net:
+
+```console
+find net -name Makefile \
+    | xargs -L1 -I {} bash -c 'echo "KCOV_INSTRUMENT := y" >> {}'
+```
+
+en la siguiente foto podemos ver un grep que muestra en que Makefiles se activo kcov:
+
+![](docs/img/30.png)
+
+esto nos da la ventaja de poder aislar parcialmente **las zonas que nos interesan auditar**
+
+esto le debe agregar algo a esos basic blocks para que reporten, pero por ahora no le vamos a dar importancia a eso
+
+## como obtiene las direcciones ejecutadas en kernel
+
+en el switch para agarrar los argumentos a lo getopt tiene el procesamiento de 'd':
+
+fuzznetlink.c:84
+```c
+        case 'd':
+            state->dump++;
+            break;
+```
+
+y mas abajo vemos que si esta prendido este flag, imprime las direcciones en hexa como ya vimos:
+
+fuzznetlink.c:242
+```c
+            if (state->dump) {
+                printf("0x%016lx%s\n", current_loc, "");
+            }
+```
+
+current\_loc es la direccion que tiene la posta del basic block ejecutado, si vemos el bucle entero que procesa el TRACE
+
+fuzznetlink.c:223
+```c
+        /* Read recorded %rip */
+        int i;
+        uint64_t afl_prev_loc = 0;
+        for (i = 0; i < kcov_len; i++) {
+            uint64_t current_loc = kcov_cover_buf[i + 1];
+            uint64_t hash = hsiphash_static(&current_loc,
+                            sizeof(unsigned long));
+            uint64_t mixed = (hash & 0xffff) ^ afl_prev_loc;
+            afl_prev_loc = (hash & 0xffff) >> 1;
+
+            uint8_t *s = &afl_area_ptr[mixed];
+            int r = __builtin_add_overflow(*s, 1, s);
+            if (r) {
+                /* Boxing. AFL is fine with overflows,
+                 * but we can be better. Drop down to
+                 * 128 on overflow. */
+                *s = 128;
+            }
+
+            if (state->dump) {
+                printf("0x%016lx%s\n", current_loc, "");
+            }
+        }
+```
+
+lo saca del kcov\_cover\_buf indexandolo desde 1 (eso parece raro)
+
+kcov\_cover\_buf es un array de direcciones de 64 bits
+
+fuzznetlink.c:113
+```c
+    struct kcov *kcov = NULL;
+    uint64_t *kcov_cover_buf = NULL;
+    if (state->no_kcov == 0) {
+        kcov = kcov_new();
+        kcov_cover_buf = kcov_cover(kcov);
+    }
+```
+
+me encanta la falsa orientacion a objetos que armo, divino, vamos a ver kcov\_cover
+
+kcov.c:89
+```c
+uint64_t *kcov_cover(struct kcov *kcov) { return kcov->cover; }
+```
+
+lo unico que hay que saber de la falsa OOP es que siempre le pasa como 1er argumento un pseudo-this
+
+kcov-\>cover fue cargado en el "constructor"
+
+kcov.c:24
+```c
+struct kcov *kcov_new(void)
+{
+    int fd = open("/sys/kernel/debug/kcov", O_RDWR);
+    if (fd == -1) {
+        PFATAL("open(/sys/kernel/debug/kcov)");
+    }
+
+    /* Setup trace mode and trace size. */
+    int r = ioctl(fd, KCOV_INIT_TRACE, COVER_SIZE);
+    if (r != 0) {
+        PFATAL("ioctl(KCOV_INIT_TRACE)");
+    }
+
+    /* Mmap buffer shared between kernel- and user-space. */
+    unsigned long *cover = (unsigned long *)mmap(
+        NULL, COVER_SIZE * sizeof(unsigned long),
+        PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    if ((void *)cover == MAP_FAILED) {
+        PFATAL("mmap(/sys/kernel/debug/kcov)");
+    }
+    struct kcov *kcov = calloc(1, sizeof(struct kcov));
+    kcov->fd = fd;
+    kcov->cover = cover;
+    return kcov;
+}
+```
+
+cover es un buffer para almacenar 
+
+kcov.c:14
+```c
+#define COVER_SIZE (64 << 10)
+```
+
+que no es mas que una forma cheta de poner 65536
+
+fijense que esta MAP\_SHARED y los flags, eso debe ser los permisos que necesita para que se le guarden los datos
+
+todo apunta que la parte de carga del trace se hace por aca:
+
+kcov.c:51
+```c
+void kcov_enable(struct kcov *kcov)
+{
+    /* reset counter */
+    __atomic_store_n(&kcov->cover[0], 0, __ATOMIC_RELAXED);
+
+    int r = ioctl(kcov->fd, KCOV_ENABLE, KCOV_TRACE_PC);
+    if (r != 0) {
+        PFATAL("ioctl(KCOV_ENABLE)");
+    }
+
+    /* Reset coverage. */
+    __atomic_store_n(&kcov->cover[0], 0, __ATOMIC_RELAXED);
+    __sync_synchronize();
+}
+```
+
+\_\_atomic\_store\_n
