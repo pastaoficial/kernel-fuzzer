@@ -673,4 +673,110 @@ int main(int argc, char **argv)
 }
 ```
 
+KCOV nos tira las direcciones de los basic blocks ejecutados, si quisieramos podriamos saber la linea ejecutada pipeando a addr2line, para tener una salida similar a esta:
+
+```
+SyS\_read
+\_\_fs/read\_write.c:562
+fdget\_pos
+\_\_fs/file.c:774
+fget\_light
+\_\_fs/file.c:746
+fget\_light
+\_\_fs/file.c:750
+fget\_light
+fs/file.c:760
+fdget\_pos
+\_\_fs/file.c:784
+SyS\_read
+fs/read\_write.c:562
+```
+
+pero para nuestros menesteres, nos valemos solo con el raw %rip
+
+## que da kcov?
+
+las direcciones crudas en memoria del basic block que se ejecuto, si lo redireccionas a addr2line podes tener la linea de codigo del bloque que se ejecuto
+
+```
+$ ./fuzznetlink --dump --one-run < test_case.bin \
+    | addr2line -e ./linux/vmlinux
+[-] Running outside of AFL
+linux/net/socket.c:1514
+linux/net/socket.c:1500
+linux/net/socket.c:1502
+linux/net/socket.c:1353
+linux/net/socket.c:1355
+```
+
+## como traduce la direccion de KCOV a AFL
+
+para pasar de un lado a otro, obtiene la direccion, le genera un hash unico a esa direccion usando el algoritmo hsiphash\_static
+
+```c
+            uint64_t current_loc = kcov_cover_buf[i + 1];
+            uint64_t hash = hsiphash_static(&current_loc,
+                            sizeof(unsigned long));
+            uint64_t mixed = (hash & 0xffff) ^ afl_prev_loc;
+            afl_prev_loc = (hash & 0xffff) >> 1;
+``` 
+
+cito al loco
+
+But we achieved our goal - we set up a basic, yet still useful fuzzer against a kernel. Most importantly: the same machinery can be reused to fuzz other parts of Linux subsystems - from file systems to bpf verifier.
+
+## el argumento --one-run
+
+hace una sola ejecucion del bucle, no forkea, con eso conseguimos poder tracearlo, util para tunear el fuzzer, una vez que con un archivito, llegaste a la zona que te interesa fuzzear
+
+TIPAZOOO
+
+## que devuelve hsiphash\_static
+
+esto lo tengo que saber por simple curiosidad
+
+### me hice un clientito de la lib
+
+para hacer esto, solo tire este codigo en donde estaba el codigo fuente del fuzznetlink original:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <ctype.h>
+
+#include "common.h"
+
+int main(int argc, char **argv) {
+    uint64_t n, *p;
+
+    if (argc > 1 ) {
+        n = atoi(argv[1]);
+        p = &n;
+        printf("0x%x", hsiphash_static(p, sizeof(unsigned long)));
+    }
+
+    return 0;
+}
+```
+
+como bien decia la documentacion por todos lados, es un algoritmo optimizado que le entran uint32 y escupe uint32, cada uno diferente al anterior por anda a saber que metodo
+
+para compilarlo le tire un:
+
+```console
+gcc -Wextra siphash.c -o checkhash checkhash.c -g
+```
+
+![](docs/img/31.png)
+
+pero que onda, antes eran short int los valores que indexaban al buffer loco de afl, es por eso que el chabon les hace un casting feo, agarrando solo los 0xffff bytes
+
+```c
+            uint64_t mixed = (hash & 0xffff) ^ afl_prev_loc;
+            afl_prev_loc = (hash & 0xffff) >> 1;
+```
+
+que colisione el hash tenes que tener mucha mala suerte, pasara una vez cada muerte de obispo y de ultima en el peor de los casos te dara un falso positivo diciendo que encontro un crash
+
 
