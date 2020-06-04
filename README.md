@@ -779,4 +779,49 @@ pero que onda, antes eran short int los valores que indexaban al buffer loco de 
 
 que colisione el hash tenes que tener mucha mala suerte, pasara una vez cada muerte de obispo y de ultima en el peor de los casos te dara un falso positivo diciendo que encontro un crash
 
+## como le mete el input generado al chunk fuzzeado
 
+```c
+                /* Load input from AFL (stdin) */
+                char buf[512 * 1024];
+                memset(buf, 0, 32);
+                int buf_len = read(0, buf, sizeof(buf));
+                if (buf_len < 0) {
+                        PFATAL("read(stdin)");
+                }
+                if (buf_len < 5) {
+                        buf_len = 5;
+                }
+                if (state->verbose) {
+                        fprintf(stderr, "[.] %d bytes on input\n", buf_len);
+                }
+
+```
+
+lee stdin, de ahi le viene el paquete crafteado, lo guarda en buf y de ahi lo deployea como parte de estructuras y fruta
+
+```c
+                struct sockaddr_nl sa = {
+                        .nl_family = AF_NETLINK,
+                        .nl_groups = (buf[1] << 24) | (buf[2] << 16) |
+                                     (buf[3] << 8) | buf[4],
+                };
+```
+
+```c
+                struct iovec iov = {&buf[5], buf_len - 5};
+                struct sockaddr_nl sax = {
+                        .nl_family = AF_NETLINK,
+                };
+                struct msghdr msg = {&sax, sizeof(sax), &iov, 1, NULL, 0, 0};
+                r = sendmsg(netlink_fd, &msg, 0);
+                if (r != -1) {
+                        char buf[8192];
+                        struct iovec iov = {buf, sizeof(buf)};
+                        struct sockaddr_nl sa;
+                        struct msghdr msg = {&sa,  sizeof(sa), &iov, 1,
+                                             NULL, 0,     0};
+                        recvmsg(netlink_fd, &msg, 0);
+                }
+
+```
